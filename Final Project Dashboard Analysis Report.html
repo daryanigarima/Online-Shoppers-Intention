@@ -1,0 +1,1633 @@
+<html lang="en"><head>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js" integrity="sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+    <script>
+      (function() {
+        const originalConsole = window.console;
+        window.console = {
+          log: (...args) => {
+            originalConsole.log(...args);
+            window.parent.postMessage({ type: 'console', message: args.join(' ') }, '*');
+          },
+          error: (...args) => {
+            originalConsole.error(...args);
+            window.parent.postMessage({ type: 'console', message: 'Error: ' + args.join(' ') }, '*');
+          },
+          warn: (...args) => {
+            originalConsole.warn(...args);
+            window.parent.postMessage({ type: 'console', message: 'Warning: ' + args.join(' ') }, '*');
+          }
+        };
+
+        let requestId = 0;
+        let callbacksMap = new Map();
+        let streamControllers = new Map();
+        
+        window.claude = {
+          complete: (prompt) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
+            });
+          }
+        };
+
+        window.storage = {
+          get: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageGet', id, key, shared }, '*');
+            });
+          },
+          set: (key, value, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
+            });
+          },
+          delete: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
+            });
+          },
+          list: (prefix, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
+            });
+          }
+        };
+
+        let pendingBlobs = new Map();
+        URL.createObjectURL = (blob) => {
+          // Store the blob and create an ID and URL for it
+          const blobId = `blob-${Date.now()}-${Math.random()}`;
+          pendingBlobs.set(blobId, blob);
+          return `blob-request://${blobId}`;
+        };
+
+        URL.revokeObjectURL = (url) => {
+          // Remove the blob from our store
+          const blobId = url.replace("blob-request://", "");
+          pendingBlobs.delete(blobId);
+        };
+
+        const getBlobFromURL = (url) => {
+          const blobId = url.replace("blob-request://", "");
+          return pendingBlobs.get(blobId);
+        };
+
+        // Override global fetch with streaming support
+        window.fetch = (url, init = {}) => {
+          return new Promise((resolve, reject) => {
+            const id = requestId++;
+            const channelId = `fetch-${id}-${Date.now()}`;
+            
+            callbacksMap.set(id, { 
+              resolve: (response) => {
+                // Create a ReadableStream for the response body
+                const stream = new ReadableStream({
+                  start(controller) {
+                    streamControllers.set(channelId, controller);
+                  },
+                  cancel() {
+                    streamControllers.delete(channelId);
+                  }
+                });
+                
+                // Create and return the Response with the stream
+                resolve(new Response(stream, {
+                  status: response.status,
+                  statusText: response.statusText,
+                  headers: response.headers
+                }));
+              },
+              reject,
+              channelId
+            });
+            
+            window.parent.postMessage({
+              type: 'proxyFetch',
+              id,
+              url,
+              init,
+              channelId
+            }, '*');
+          });
+        };
+
+        window.addEventListener('message', async (event) => {
+          if (event.data.type === 'takeScreenshot') {
+            const rootElement = document.getElementById('artifacts-component-root-html');
+            if (!rootElement) {
+              window.parent.postMessage({
+                type: 'screenshotError',
+                error: new Error('Root element not found'),
+              }, '*');
+            }
+            const screenshot = await htmlToImage.toPng(rootElement, {
+              imagePlaceholder:
+                "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
+            });
+            window.parent.postMessage({
+              type: 'screenshotData',
+              data: screenshot,
+            }, '*');
+          } else if (event.data.type === 'claudeComplete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.completion);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'proxyFetchResponse') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+              callbacksMap.delete(event.data.id);
+            } else {
+              // Initial response with headers, status, etc.
+              callback.resolve({
+                status: event.data.status,
+                statusText: event.data.statusText,
+                headers: event.data.headers
+              });
+              // Don't delete the callback yet if streaming
+              if (!event.data.body) {
+                callbacksMap.delete(event.data.id);
+              }
+            }
+          } else if (event.data.type === 'proxyFetchStream') {
+            // Handle streaming data chunks
+            const controller = streamControllers.get(event.data.channelId);
+            if (controller) {
+              if (event.data.error) {
+                controller.error(new Error(event.data.error));
+                streamControllers.delete(event.data.channelId);
+              } else if (event.data.done) {
+                controller.close();
+                streamControllers.delete(event.data.channelId);
+                // Clean up the callback
+                const callback = Array.from(callbacksMap.entries()).find(
+                  ([_, value]) => value.channelId === event.data.channelId
+                );
+                if (callback) {
+                  callbacksMap.delete(callback[0]);
+                }
+              } else if (event.data.chunk) {
+                controller.enqueue(new Uint8Array(event.data.chunk));
+              }
+            }
+          } else if (event.data.type === 'storageGet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageSet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageDelete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageList') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          }
+        });
+
+        window.addEventListener('click', (event) => {
+          const isEl = event.target instanceof HTMLElement;
+          if (!isEl) return;
+    
+          // find ancestor links
+          const linkEl = event.target.closest("a");
+          if (!linkEl || !linkEl.href) return;
+    
+          event.preventDefault();
+          event.stopImmediatePropagation();
+    
+          if (linkEl.href.startsWith("blob-request:")) {
+            const blob = getBlobFromURL(linkEl.href);
+            if (!blob) return;
+            void blob.arrayBuffer().then((data) => {
+              window.parent.postMessage({
+                type: "downloadFile",
+                filename: linkEl.download,
+                data,
+                mimeType: blob.type || "application/octet-stream",
+              });
+            });
+          } else if (linkEl.href.startsWith("data:")) {
+            const [header, base64Data] = linkEl.href.split(",");
+            const mimeMatch = header.match(/data:([^;]+)/);
+            const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
+            const binaryString = atob(base64Data);
+            const data = Uint8Array.from(binaryString, (c) =>
+              c.charCodeAt(0),
+            ).buffer;
+            window.parent.postMessage({
+              type: "downloadFile",
+              filename: linkEl.download,
+              data,
+              mimeType,
+            });
+          } else {
+            let linkUrl;
+            try {
+              linkUrl = new URL(linkEl.href);
+            } catch (error) {
+              return;
+            }
+    
+            if (linkUrl.hostname === window.location.hostname) return;
+      
+            window.parent.postMessage({
+              type: 'openExternal',
+              href: linkEl.href,
+            }, '*');
+          }
+      });
+
+        const originalOpen = window.open;
+        window.open = function (url) {
+          window.parent.postMessage({
+            type: "openExternal",
+            href: url,
+          }, "*");
+        };
+
+        window.addEventListener('error', (event) => {
+          window.parent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
+        });
+      })();
+    </script>
+  
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js" integrity="sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Dashboard Analysis Report</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Google Sans', 'Roboto', Arial, sans-serif;
+            line-height: 1.6;
+            color: #202124;
+            background: #f8f9fa;
+            padding: 20px;
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            background: white;
+            padding: 40px;
+            border-radius: 8px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.12);
+        }
+
+        .header {
+            background: linear-gradient(135deg, #4285f4, #34a853);
+            color: white;
+            padding: 40px;
+            border-radius: 8px;
+            margin-bottom: 40px;
+            text-align: center;
+        }
+
+        .header h1 {
+            font-size: 42px;
+            margin-bottom: 10px;
+            font-weight: 400;
+        }
+
+        .header p {
+            font-size: 18px;
+            opacity: 0.95;
+        }
+
+        .nav-buttons {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 30px;
+            flex-wrap: wrap;
+            justify-content: center;
+        }
+
+        .nav-btn {
+            background: #4285f4;
+            color: white;
+            padding: 12px 24px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: 500;
+            transition: all 0.3s;
+        }
+
+        .nav-btn:hover {
+            background: #1967d2;
+            box-shadow: 0 2px 8px rgba(66, 133, 244, 0.3);
+        }
+
+        .nav-btn.active {
+            background: #34a853;
+        }
+
+        .page-section {
+            display: none;
+            animation: fadeIn 0.5s;
+        }
+
+        .page-section.active {
+            display: block;
+        }
+
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(20px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        .page-title {
+            background: #4285f4;
+            color: white;
+            padding: 20px 30px;
+            border-radius: 8px;
+            margin-bottom: 30px;
+        }
+
+        .page-title h2 {
+            font-size: 32px;
+            font-weight: 400;
+            margin-bottom: 5px;
+        }
+
+        .page-title p {
+            font-size: 16px;
+            opacity: 0.9;
+        }
+
+        .visual-card {
+            background: #f8f9fa;
+            border-left: 4px solid #4285f4;
+            padding: 25px;
+            margin-bottom: 25px;
+            border-radius: 4px;
+        }
+
+        .visual-card h3 {
+            color: #1967d2;
+            font-size: 24px;
+            margin-bottom: 15px;
+            font-weight: 500;
+        }
+
+        .visual-card h4 {
+            color: #5f6368;
+            font-size: 16px;
+            margin: 20px 0 10px 0;
+            font-weight: 500;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .visual-card p, .visual-card li {
+            color: #3c4043;
+            font-size: 15px;
+            line-height: 1.8;
+            margin-bottom: 10px;
+        }
+
+        .visual-card ul {
+            list-style: none;
+            padding-left: 0;
+        }
+
+        .visual-card li:before {
+            content: "→";
+            color: #34a853;
+            font-weight: bold;
+            margin-right: 10px;
+        }
+
+        .metric-box {
+            background: white;
+            border: 1px solid #dadce0;
+            padding: 15px;
+            border-radius: 4px;
+            margin: 15px 0;
+        }
+
+        .metric-box strong {
+            color: #1967d2;
+            font-size: 28px;
+            display: block;
+            margin-bottom: 5px;
+        }
+
+        .metric-box span {
+            color: #5f6368;
+            font-size: 14px;
+        }
+
+        .insight-box {
+            background: #e8f5e9;
+            border-left: 4px solid #34a853;
+            padding: 20px;
+            margin: 20px 0;
+            border-radius: 4px;
+        }
+
+        .insight-box h4 {
+            color: #1e8e3e;
+            margin-bottom: 10px;
+            font-size: 18px;
+        }
+
+        .insight-box p {
+            color: #137333;
+            margin: 0;
+        }
+
+        .action-box {
+            background: #fef7e0;
+            border-left: 4px solid #f9ab00;
+            padding: 20px;
+            margin: 20px 0;
+            border-radius: 4px;
+        }
+
+        .action-box h4 {
+            color: #e37400;
+            margin-bottom: 10px;
+            font-size: 18px;
+        }
+
+        .action-box p {
+            color: #7c4a00;
+            margin: 0;
+        }
+
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 15px;
+            margin: 20px 0;
+        }
+
+        .stat-card {
+            background: white;
+            border: 2px solid #dadce0;
+            padding: 20px;
+            border-radius: 8px;
+            text-align: center;
+        }
+
+        .stat-card .number {
+            color: #4285f4;
+            font-size: 36px;
+            font-weight: 500;
+            display: block;
+            margin-bottom: 5px;
+        }
+
+        .stat-card .label {
+            color: #5f6368;
+            font-size: 14px;
+        }
+
+        .code-block {
+            background: #f1f3f4;
+            padding: 15px;
+            border-radius: 4px;
+            font-family: 'Courier New', monospace;
+            font-size: 13px;
+            overflow-x: auto;
+            margin: 15px 0;
+            border-left: 3px solid #4285f4;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 20px 0;
+        }
+
+        table th {
+            background: #4285f4;
+            color: white;
+            padding: 12px;
+            text-align: left;
+            font-weight: 500;
+        }
+
+        table td {
+            padding: 12px;
+            border-bottom: 1px solid #dadce0;
+        }
+
+        table tr:hover {
+            background: #f8f9fa;
+        }
+
+        .download-all {
+            position: fixed;
+            bottom: 30px;
+            right: 30px;
+            background: #ea4335;
+            color: white;
+            padding: 15px 30px;
+            border: none;
+            border-radius: 50px;
+            cursor: pointer;
+            font-size: 16px;
+            font-weight: 500;
+            box-shadow: 0 4px 12px rgba(234, 67, 53, 0.4);
+            z-index: 1000;
+        }
+
+        .download-all:hover {
+            background: #d33b2c;
+            transform: translateY(-2px);
+            box-shadow: 0 6px 16px rgba(234, 67, 53, 0.5);
+        }
+
+        @media print {
+            .nav-buttons, .download-all {
+                display: none;
+            }
+            .page-section {
+                display: block !important;
+                page-break-after: always;
+            }
+        }
+    </style>
+</head>
+<body id="artifacts-component-root-html">
+    <div class="container">
+        <!-- Header -->
+        <div class="header">
+            <h1>📊 Online Shoppers Dashboard Analysis</h1>
+            <p>Complete Page-by-Page Analysis Flow | Power BI Dashboard Project</p>
+        </div>
+
+        <!-- Navigation -->
+        <div class="nav-buttons">
+            <button class="nav-btn" onclick="showPage('overview')">Overview</button>
+            <button class="nav-btn" onclick="showPage('page1')">Page 1: Executive</button>
+            <button class="nav-btn" onclick="showPage('page2')">Page 2: Journey</button>
+            <button class="nav-btn" onclick="showPage('page3')">Page 3: Abandonment</button>
+            <button class="nav-btn" onclick="showPage('page4')">Page 4: Segmentation</button>
+            <button class="nav-btn" onclick="showPage('page5')">Page 5: Traffic</button>
+            <button class="nav-btn active" onclick="showPage('summary')">Key Findings</button>
+        </div>
+
+        <!-- Overview Section -->
+        <div id="overview" class="page-section">
+            <div class="page-title">
+                <h2>📋 Project Overview</h2>
+                <p>Dashboard Structure &amp; Analysis Approach</p>
+            </div>
+
+            <div class="visual-card">
+                <h3>Dataset Information</h3>
+                <div class="stats-grid">
+                    <div class="stat-card">
+                        <span class="number">12,330</span>
+                        <span class="label">Total Sessions</span>
+                    </div>
+                    <div class="stat-card">
+                        <span class="number">18</span>
+                        <span class="label">Original Features</span>
+                    </div>
+                    <div class="stat-card">
+                        <span class="number">15+</span>
+                        <span class="label">Engineered Features</span>
+                    </div>
+                    <div class="stat-card">
+                        <span class="number">15%</span>
+                        <span class="label">Conversion Rate</span>
+                    </div>
+                </div>
+
+                <h4>Analysis Objectives</h4>
+                <ul>
+                    <li>Identify key conversion drivers and optimization opportunities</li>
+                    <li>Understand customer journey patterns and pain points</li>
+                    <li>Segment high-value customer profiles</li>
+                    <li>Discover seasonal and temporal trends</li>
+                    <li>Analyze traffic quality and regional performance</li>
+                </ul>
+            </div>
+
+            <div class="visual-card">
+                <h3>Dashboard Structure</h3>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Page</th>
+                            <th>Purpose</th>
+                            <th>Key Visuals</th>
+                            <th>Primary Insight</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td><strong>Page 1</strong></td>
+                            <td>Executive Overview</td>
+                            <td>KPIs, Funnel, Donut, Trend Line</td>
+                            <td>15% conversion with funnel optimization opportunities</td>
+                        </tr>
+                        <tr>
+                            <td><strong>Page 2</strong></td>
+                            <td>Customer Journey Analysis</td>
+                            <td>Waterfall, Stacked Bar, Scatter, Matrix</td>
+                            <td>Multi-section explorers show higher conversion patterns</td>
+                        </tr>
+                        <tr>
+                            <td><strong>Page 3</strong></td>
+                            <td>Abandonment Analysis</td>
+                            <td>Gauges, Area Chart, Column Chart</td>
+                            <td>Engagement patterns vary across months with Q4 peaks</td>
+                        </tr>
+                        <tr>
+                            <td><strong>Page 4</strong></td>
+                            <td>Visitor Segmentation</td>
+                            <td>Treemap, Decomposition Tree</td>
+                            <td>Returning weekday visitors are highest-value segment</td>
+                        </tr>
+                        <tr>
+                            <td><strong>Page 5</strong></td>
+                            <td>Traffic &amp; Technology</td>
+                            <td>Sankey Diagram, Bubble Chart</td>
+                            <td>High-quality traffic drives disproportionate conversions</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        <!-- Page 1: Executive Overview -->
+        <div id="page1" class="page-section">
+            <div class="page-title">
+                <h2>📊 Page 1: Executive Overview Dashboard</h2>
+                <p>High-level KPIs and Overall Performance Metrics</p>
+            </div>
+
+            <!-- Visual 1: KPI Cards -->
+            <div class="visual-card">
+                <h3>Visual 1: Key Performance Indicators (4 KPI Cards)</h3>
+                
+                <h4>Metrics Displayed</h4>
+                <div class="stats-grid">
+                    <div class="metric-box">
+                        <strong>12,330</strong>
+                        <span>Total Sessions</span>
+                    </div>
+                    <div class="metric-box">
+                        <strong>15%</strong>
+                        <span>Conversion Rate</span>
+                    </div>
+                    <div class="metric-box">
+                        <strong>38 mins</strong>
+                        <span>Avg Duration/Page</span>
+                    </div>
+                    <div class="metric-box">
+                        <strong>1,908</strong>
+                        <span>Total Converters</span>
+                    </div>
+                </div>
+
+                <h4>Analysis</h4>
+                <ul>
+                    <li>12,330 total sessions provide a substantial dataset for analysis</li>
+                    <li>15% conversion rate shows healthy baseline performance for e-commerce</li>
+                    <li>38 minutes average duration indicates engaged user behavior</li>
+                    <li>1,908 successful conversions represent the revenue-generating segment</li>
+                </ul>
+
+                <div class="insight-box">
+                    <h4>💡 Key Insight</h4>
+                    <p>The 15% conversion rate is strong compared to typical e-commerce benchmarks (2-3%), suggesting effective targeting and user experience. However, optimizing the 85% non-converting sessions represents significant growth opportunity.</p>
+                </div>
+
+                <div class="action-box">
+                    <h4>🎯 Recommendation</h4>
+                    <p>Focus on converting the "engaged but not converted" segment through A/B testing, improved CTAs, and reduced friction points. Even a 2% improvement would add 246 conversions monthly.</p>
+                </div>
+            </div>
+
+            <!-- Visual 2: Purchase Journey Funnel -->
+            <div class="visual-card">
+                <h3>Visual 2: Purchase Journey Funnel</h3>
+                
+                <h4>Purpose</h4>
+                <p>Visualize the conversion path from initial session to purchase, identifying drop-off points at each stage.</p>
+
+                <h4>Funnel Stages</h4>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Stage</th>
+                            <th>Sessions</th>
+                            <th>% of Initial</th>
+                            <th>Drop-off Rate</th>
+                            <th>Status</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td>All Sessions</td>
+                            <td>12,330</td>
+                            <td>100%</td>
+                            <td>-</td>
+                            <td>✓ Baseline</td>
+                        </tr>
+                        <tr>
+                            <td>Product Viewers</td>
+                            <td>11,989</td>
+                            <td>97.2%</td>
+                            <td>2.8%</td>
+                            <td>✓ Excellent</td>
+                        </tr>
+                        <tr>
+                            <td>Deep Sessions</td>
+                            <td>8,915</td>
+                            <td>72.3%</td>
+                            <td>25.6%</td>
+                            <td>⚠️ Major Drop-off</td>
+                        </tr>
+                        <tr>
+                            <td>High Value Pages</td>
+                            <td>2,730</td>
+                            <td>22.1%</td>
+                            <td>50.2%</td>
+                            <td>❌ Critical Loss</td>
+                        </tr>
+                        <tr>
+                            <td>Converters</td>
+                            <td>1,908</td>
+                            <td>15.5%</td>
+                            <td>30.1%</td>
+                            <td>✓ Target</td>
+                        </tr>
+                    </tbody>
+                </table>
+
+                <div class="insight-box">
+                    <h4>💡 Critical Finding</h4>
+                    <p>The largest drop-off occurs between Deep Sessions and High Value Pages (50.2% loss). This represents the single most important optimization opportunity in the entire funnel.</p>
+                </div>
+
+                <div class="action-box">
+                    <h4>🎯 Optimization Priority</h4>
+                    <p>Reduce the Deep Sessions → High Value Pages drop-off from 50% to 35% through: personalized product recommendations, improved search functionality, clearer value propositions, and streamlined navigation. Expected impact: +415 conversions monthly.</p>
+                </div>
+            </div>
+
+            <!-- Visual 3: Dominant Page Type Distribution -->
+            <div class="visual-card">
+                <h3>Visual 3: Dominant Page Type Distribution (Donut Chart)</h3>
+                
+                <h4>Purpose</h4>
+                <p>Understand user browsing patterns and identify which page types correlate with higher conversion.</p>
+
+                <h4>Distribution Analysis</h4>
+                <ul>
+                    <li><strong>Product_Focused:</strong> 11,989 sessions (97.23%) - Dominant browsing pattern</li>
+                    <li><strong>Info_Focused:</strong> 195 sessions (1.58%) - Small informational segment</li>
+                    <li><strong>Admin_Focused:</strong> 146 sessions (1.18%) - Checkout/account focused</li>
+                </ul>
+
+                <div class="insight-box">
+                    <h4>💡 Key Pattern</h4>
+                    <p>97% of sessions are product-focused, indicating that users come with clear purchase intent. The extremely low admin-focused percentage (1.18%) suggests users either convert quickly or abandon before reaching checkout.</p>
+                </div>
+
+                <div class="action-box">
+                    <h4>🎯 Strategy</h4>
+                    <p>Since product pages dominate, optimize product page experience: high-quality images, detailed descriptions, customer reviews, clear pricing, and prominent "Add to Cart" buttons. For the small info-focused segment, ensure seamless transition from information to products.</p>
+                </div>
+            </div>
+
+            <!-- Visual 4: Monthly Sessions & Conversion Trend -->
+            <div class="visual-card">
+                <h3>Visual 4: Monthly Sessions &amp; Conversion Trend (Line &amp; Column Chart)</h3>
+                
+                <h4>Purpose</h4>
+                <p>Identify seasonal patterns and optimize marketing timing throughout the year.</p>
+
+                <h4>Temporal Pattern Analysis</h4>
+                <ul>
+                    <li><strong>November Peak:</strong> Highest session volume with 18.2% conversion rate</li>
+                    <li><strong>Q4 Advantage:</strong> October-December show elevated traffic and conversion</li>
+                    <li><strong>May Surge:</strong> Notable spike visible in sessions around May</li>
+                    <li><strong>Seasonal Variation:</strong> Conversion rate fluctuates between 0.1-0.3 across months</li>
+                </ul>
+
+                <div class="insight-box">
+                    <h4>💡 Seasonality Insight</h4>
+                    <p>November shows the strongest performance in both volume and conversion rate, likely driven by holiday shopping behavior. The data reveals clear seasonal patterns that should inform marketing budget allocation.</p>
+                </div>
+
+                <div class="action-box">
+                    <h4>🎯 Marketing Strategy</h4>
+                    <p>Increase marketing budget by 40% during Q4 (Oct-Dec) to capitalize on high-intent traffic. Prepare inventory, optimize checkout, and deploy urgency messaging (countdown timers, limited stock alerts) during peak months. Apply Q4 tactics year-round where conversion rates dip.</p>
+                </div>
+            </div>
+        </div>
+
+        <!-- Page 2: Customer Journey -->
+        <div id="page2" class="page-section">
+            <div class="page-title">
+                <h2>🛤️ Page 2: Customer Journey Analysis</h2>
+                <p>Understanding User Navigation and Engagement Patterns</p>
+            </div>
+
+            <!-- Visual 1: Session Flow Waterfall -->
+            <div class="visual-card">
+                <h3>Visual 1: Session Flow - Acquisition to Conversion (Waterfall Chart)</h3>
+                
+                <h4>Purpose</h4>
+                <p>Visualize the incremental changes in sessions as users progress from entry to conversion, highlighting gains and losses at each stage.</p>
+
+                <h4>Flow Breakdown</h4>
+                <ul>
+                    <li><strong>All Sessions (Baseline):</strong> Starting point of 12.3K sessions</li>
+                    <li><strong>High Engagement (Green):</strong> +16.3K sessions showing strong engagement</li>
+                    <li><strong>Multi-Explorer (Green):</strong> Additional positive flow of engaged multi-page visitors</li>
+                    <li><strong>Converters (Orange):</strong> Final conversion segment</li>
+                    <li><strong>Quick Bounce &amp; Total (Markers):</strong> Reference points showing losses</li>
+                </ul>
+
+                <div class="insight-box">
+                    <h4>💡 Journey Insight</h4>
+                    <p>The waterfall clearly shows positive momentum through High Engagement and Multi-Explorer stages before final conversion. The visual separation between engaged users and converters represents the optimization gap.</p>
+                </div>
+
+                <div class="action-box">
+                    <h4>🎯 Action Plan</h4>
+                    <p>Reduce the gap between Multi-Explorer and Converters through: exit-intent popups with discounts, abandoned cart emails, live chat support during browsing, and social proof elements. Focus on converting already-engaged users.</p>
+                </div>
+            </div>
+
+            <!-- Visual 2: Engagement Quality Scatter Plot -->
+            <div class="visual-card">
+                <h3>Visual 2: Engagement Quality - Duration vs Page Value (Scatter Plot)</h3>
+                
+                <h4>Purpose</h4>
+                <p>Analyze the relationship between time spent and page value to identify optimal engagement patterns.</p>
+
+                <h4>Scatter Analysis</h4>
+                <ul>
+                    <li><strong>Deliberate Browsers (Top section):</strong> High page value visitors spending 200-400 units of time</li>
+                    <li><strong>Normal Browsers (Middle cluster):</strong> Moderate engagement with balanced value</li>
+                    <li><strong>Quick Browsers (Bottom cluster):</strong> Low engagement, minimal page value</li>
+                    <li><strong>Pattern:</strong> Most data points cluster between 0-200 time units and 0-2000 page value</li>
+                </ul>
+
+                <div class="insight-box">
+                    <h4>💡 Engagement Sweet Spot</h4>
+                    <p>There's a clear positive correlation up to approximately 200 time units, after which additional time doesn't significantly increase page value. This suggests an optimal engagement window where users are most likely to convert.</p>
+                </div>
+
+                <div class="action-box">
+                    <h4>🎯 Optimization Target</h4>
+                    <p>Design experiences to keep users in the 100-200 time unit sweet spot through: fast page loads, clear navigation, scannable content, and timely CTAs. Avoid overwhelming users with too much information that extends time without adding value.</p>
+                </div>
+            </div>
+
+            <!-- Visual 3: Conversion by Session Complexity -->
+            <div class="visual-card">
+                <h3>Visual 3: Conversion by Session Complexity (100% Stacked Bar Chart)</h3>
+                
+                <h4>Purpose</h4>
+                <p>Compare conversion performance across different user exploration patterns.
+
+                </p><h4>Complexity Segments</h4>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Segment</th>
+                            <th>Sessions</th>
+                            <th>% of Total</th>
+                            <th>Revenue Split</th>
+                            <th>Pattern</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td>Single_Section_Visitor</td>
+                            <td>~8,200</td>
+                            <td>~67%</td>
+                            <td>Revenue: False majority</td>
+                            <td>Low conversion</td>
+                        </tr>
+                        <tr>
+                            <td>Two_Section_Visitor</td>
+                            <td>~3,300</td>
+                            <td>~27%</td>
+                            <td>Moderate conversion</td>
+                            <td>Medium engagement</td>
+                        </tr>
+                        <tr>
+                            <td>Multi_Section_Explorer</td>
+                            <td>~800</td>
+                            <td>~6%</td>
+                            <td>Revenue: True (higher %)</td>
+                            <td>✓ Best conversion</td>
+                        </tr>
+                    </tbody>
+                </table>
+
+                <div class="insight-box">
+                    <h4>💡 Critical Finding</h4>
+                    <p>Multi-Section Explorers represent only 6% of sessions but show disproportionately high conversion (green "Revenue: True" segment). Single-section visitors dominate volume (67%) but have lower conversion rates.</p>
+                </div>
+
+                <div class="action-box">
+                    <h4>🎯 Strategy</h4>
+                    <p>Convert single-section visitors into multi-section explorers through: "Related Products" widgets, "Complete the Look" bundles, cross-sell recommendations, and category navigation prompts. Moving just 10% of single-section to multi-section could add 180+ conversions monthly.</p>
+                </div>
+            </div>
+
+            <!-- Visual 4: Conversion Rate by Behavior Matrix -->
+            <div class="visual-card">
+                <h3>Visual 4: Conversion Rate by Behavior Matrix (Table)</h3>
+                
+                <h4>Purpose</h4>
+                <p>Detailed analysis of conversion rates across page type behavior and high product page engagement.</p>
+
+                <h4>Matrix Results</h4>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Dominant Page Type</th>
+                            <th>High Product Pages: No</th>
+                            <th>High Product Pages: Yes</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td><strong>Admin_Focused</strong></td>
+                            <td>0.21 (21%)</td>
+                            <td>0.10 (10%)</td>
+                        </tr>
+                        <tr>
+                            <td><strong>Balanced</strong></td>
+                            <td>0.13 (13%)</td>
+                            <td>0.13 (13%)</td>
+                        </tr>
+                        <tr>
+                            <td><strong>Info_Focused</strong></td>
+                            <td>0.05 (5%)</td>
+                            <td>- (no data)</td>
+                        </tr>
+                        <tr>
+                            <td><strong>Product_Focused</strong></td>
+                            <td>0.05 (5%)</td>
+                            <td>0.19 (19%)</td>
+                        </tr>
+                    </tbody>
+                </table>
+
+                <div class="insight-box">
+                    <h4>💡 Behavior Pattern Discovery</h4>
+                    <p>Product-focused browsing with high product page engagement achieves 19% conversion - the highest in the matrix. Surprisingly, admin-focused without high engagement shows 21%, indicating users reaching checkout are highly motivated.</p>
+                </div>
+
+                <div class="action-box">
+                    <h4>🎯 Two-Path Strategy</h4>
+                    <p>Path 1: Encourage product exploration with high engagement (19% conversion). Path 2: For motivated users reaching admin pages, streamline checkout to maintain 21% conversion. Avoid forcing users through unnecessary steps.</p>
+                </div>
+            </div>
+        </div>
+
+        <!-- Page 3: Abandonment Analysis -->
+        <div id="page3" class="page-section">
+            <div class="page-title">
+                <h2>⚠️ Page 3: Abandonment and Exit Analysis</h2>
+                <p>Identifying Friction Points and Exit Patterns</p>
+            </div>
+
+            <!-- Visual 1: Key Performance Gauges -->
+            <div class="visual-card">
+                <h3>Visual 1: Key Performance Gauges (Quick Bounce, High Exit, Engaged)</h3>
+                
+                <h4>Purpose</h4>
+                <p>Monitor critical abandonment metrics against targets using visual gauge indicators.</p>
+
+                <h4>Gauge Readings</h4>
+                <div class="stats-grid">
+                    <div class="metric-box">
+                        <strong>0.11</strong>
+                        <span>Quick Bounce Rate (Target: 0.40)</span>
+                    </div>
+                    <div class="metric-box">
+                        <strong>0.04</strong>
+                        <span>High Exit Rate (Target: 0.30)</span>
+                    </div>
+                    <div class="metric-box">
+                        <strong>0.77</strong>
+                        <span>Engaged Rate (Red zone above 0.40)</span>
+                    </div>
+                </div>
+
+                <h4>Performance Analysis</h4>
+                <ul>
+                    <li><strong>Quick Bounce (0.11):</strong> Well below 0.40 target - excellent performance ✓</li>
+                    <li><strong>High Exit (0.04):</strong> Significantly below 0.30 target - very low exit rate ✓</li>
+                    <li><strong>Engaged (0.77):</strong> High engagement rate indicating quality traffic ✓</li>
+                </ul>
+
+                <div class="insight-box">
+                    <h4>💡 Positive Finding</h4>
+                    <p>All three metrics show favorable performance. Only 11% quick bounce and 4% high exit rates indicate strong initial engagement. The 77% engaged rate suggests users find value quickly.</p>
+                </div>
+
+                <div class="action-box">
+                    <h4>🎯 Maintain Excellence</h4>
+                    <p>Current performance is strong. Focus on: monitoring these metrics weekly, documenting what's working well, A/B testing improvements carefully to avoid degrading performance, and applying successful patterns to underperforming segments.</p>
+                </div>
+            </div>
+
+            <!-- Visual 2: Abandonment Pattern Changes Over Time -->
+            <div class="visual-card">
+                <h3>Visual 2: Abandonment Pattern Changes Over Time (Area Chart)</h3>
+                
+                <h4>Purpose</h4>
+                <p>Track how engagement patterns evolve across months to identify seasonal trends.</p>
+
+                <h4>Temporal Pattern Analysis</h4>
+                <ul>
+                    <li><strong>September-October:</strong> Baseline engagement with moderate abandonment levels</li>
+                    <li><strong>November Peak:</strong> Massive surge in High_Abandonment (yellow), reaching 3,000+ sessions</li>
+                    <li><strong>May Spike:</strong> Notable Engaged (green) peak around May</li>
+                    <li><strong>December Pattern:</strong> Mix of Immediate_Exit (orange) and Late_Exit visible</li>
+                    <li><strong>Year-round:</strong> Engaged users (green) form consistent baseline</li>
+                </ul>
+
+                <div class="insight-box">
+                    <h4>💡 Seasonal Insight</h4>
+                    <p>November shows dramatically increased High_Abandonment despite being a peak shopping month. This suggests high traffic volume with mixed quality - many visitors browse but don't convert. May shows strong Engaged behavior, indicating quality traffic during that period.</p>
+                </div>
+
+                <div class="action-box">
+                    <h4>🎯 Seasonal Strategy</h4>
+                    <p>For November: Implement aggressive retargeting for high-abandonment visitors, deploy urgency messaging (countdown timers), and offer time-limited discounts. For May: Capitalize on high engagement with premium product recommendations and upsell opportunities.</p>
+                </div>
+            </div>
+
+            <!-- Visual 3: Average Bounce Rates by Abandonment Type -->
+            <div class="visual-card">
+                <h3>Visual 3: Average Bounce Rates by Abandonment Type (Column Chart)</h3>
+                
+                <h4>Purpose</h4>
+                <p>Compare bounce rate performance across different abandonment behavior segments.</p>
+
+                <h4>Bounce Rate Analysis</h4>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Abandonment Type</th>
+                            <th>Avg Bounce Rate</th>
+                            <th>Interpretation</th>
+                            <th>Priority</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td>High_Abandonment</td>
+                            <td>~0.14</td>
+                            <td>14% bounce - users explore then leave</td>
+                            <td>⚠️ Medium priority</td>
+                        </tr>
+                        <tr>
+                            <td>Immediate_Exit</td>
+                            <td>~0.06</td>
+                            <td>6% bounce - low immediate exits</td>
+                            <td>✓ Good performance</td>
+                        </tr>
+                        <tr>
+                            <td>Late_Exit</td>
+                            <td>~0.01</td>
+                            <td>1% bounce - very low late exits</td>
+                            <td>✓ Excellent</td>
+                        </tr>
+                        <tr>
+                            <td>Engaged</td>
+                            <td>~0.01</td>
+                            <td>1% bounce - engaged users stay</td>
+                            <td>✓ Excellent</td>
+                        </tr>
+                    </tbody>
+                </table>
+
+                <div class="insight-box">
+                    <h4>💡 Key Finding</h4>
+                    <p>High_Abandonment shows the highest bounce rate (14%), but it's still relatively low. Immediate_Exit at 6% suggests landing pages are effective. Late_Exit and Engaged both have minimal bounce (~1%), indicating users who explore deeply tend to stay.</p>
+                </div>
+
+                <div class="action-box">
+                    <h4>🎯 Optimization Focus</h4>
+                    <p>Target the High_Abandonment segment (14% bounce): analyze exit pages, implement exit-intent popups, add live chat for browsing support, and create remarketing campaigns. Even reducing to 10% bounce would recover significant sessions.</p>
+                </div>
+            </div>
+        </div>
+
+        <!-- Page 4: Visitor Segmentation -->
+        <div id="page4" class="page-section">
+            <div class="page-title">
+                <h2>👥 Page 4: Visitor Segmentation</h2>
+                <p>Understanding High-Value Customer Segments</p>
+            </div>
+
+            <!-- Visual 1: Visitor Segments Treemap -->
+            <div class="visual-card">
+                <h3>Visual 1: Visitor Segments - Size &amp; Conversion (Treemap)</h3>
+                
+                <h4>Purpose</h4>
+                <p>Visualize visitor segments by volume and identify high-value groups for targeting.</p>
+
+                <h4>Segment Analysis</h4>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Segment</th>
+                            <th>Approx Sessions</th>
+                            <th>Visual Size</th>
+                            <th>Strategic Value</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td><strong>Returning_Weekday</strong></td>
+                            <td>8,109</td>
+                            <td>Large (light green)</td>
+                            <td>🌟🌟🌟 Highest volume + quality</td>
+                        </tr>
+                        <tr>
+                            <td><strong>New_Weekend</strong></td>
+                            <td>486</td>
+                            <td>Small (teal)</td>
+                            <td>⚡ Growth opportunity</td>
+                        </tr>
+                        <tr>
+                            <td><strong>Returning_Weekend</strong></td>
+                            <td>2,382</td>
+                            <td>Medium (dark green)</td>
+                            <td>🌟🌟 Strong segment</td>
+                        </tr>
+                        <tr>
+                            <td><strong>New_Weekday</strong></td>
+                            <td>1,353</td>
+                            <td>Medium (teal)</td>
+                            <td>🌟 Acquisition target</td>
+                        </tr>
+                    </tbody>
+                </table>
+
+                <div class="insight-box">
+                    <h4>💡 Pareto Principle</h4>
+                    <p>Returning_Weekday visitors (8,109 sessions) represent the largest segment by far - nearly 66% of all traffic. This is your core customer base and should receive primary focus.</p>
+                </div>
+
+                <div class="action-box">
+                    <h4>🎯 Segmentation Strategy</h4>
+                    <p>Priority 1: Maximize Returning_Weekday retention through loyalty programs and personalization. Priority 2: Convert New_Weekday visitors to returning status through email nurture. Priority 3: Expand New_Weekend acquisition to grow this underrepresented segment.</p>
+                </div>
+            </div>
+
+            <!-- Visual 2: Interactive Conversion Driver Analysis -->
+            <div class="visual-card">
+                <h3>Visual 2: Interactive Conversion Driver Analysis (Decomposition Tree)</h3>
+                
+                <h4>Purpose</h4>
+                <p>AI-powered exploration of conversion factors through an interactive hierarchical tree structure.</p>
+
+                <h4>Tree Structure &amp; Key Splits</h4>
+                <ul>
+                    <li><strong>Root:</strong> Count of Revenue (total converters analyzed)</li>
+                    <li><strong>Level 1 Options:</strong> VisitorType, Shopper_Type_Time, Special_Day_Cat, Dominant_Page_Type, Duration_Cat</li>
+                    <li><strong>Top Path:</strong> Returning_Visitor (77.62%) → Weekday_Shopper (77.06%) → No_Special_Day</li>
+                </ul>
+
+                <h4>Conversion Driver Rankings</h4>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Factor</th>
+                            <th>Top Value</th>
+                            <th>% of Conversions</th>
+                            <th>Insight</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td>VisitorType</td>
+                            <td>Returning_Visitor</td>
+                            <td>77.62%</td>
+                            <td>Loyalty drives conversions</td>
+                        </tr>
+                        <tr>
+                            <td>Shopper_Type_Time</td>
+                            <td>Weekday_Shopper</td>
+                            <td>77.06%</td>
+                            <td>Weekday dominance</td>
+                        </tr>
+                        <tr>
+                            <td>Special_Day_Cat</td>
+                            <td>No_Special_Day</td>
+                            <td>72.80%</td>
+                            <td>Everyday sales matter</td>
+                        </tr>
+                        <tr>
+                            <td>Dominant_Page_Type</td>
+                            <td>Product_Focused</td>
+                            <td>72.69%</td>
+                            <td>Product browsing key</td>
+                        </tr>
+                        <tr>
+                            <td>Duration_Category</td>
+                            <td>Normal_Browser</td>
+                            <td>56.90%</td>
+                            <td>Optimal engagement</td>
+                        </tr>
+                    </tbody>
+                </table>
+
+                <div class="insight-box">
+                    <h4>💡 Ideal Converter Profile</h4>
+                    <p>The decomposition tree reveals the winning combination: Returning visitors (77.62%) who shop on weekdays (77.06%) during non-special days (72.80%), browse product pages (72.69%), and engage at a normal pace (56.90%). This is your target customer persona.</p>
+                </div>
+
+                <div class="action-box">
+                    <h4>🎯 Targeting Strategy</h4>
+                    <p>Build lookalike audiences based on this profile for acquisition campaigns. For retention: Focus weekday email campaigns, optimize product page UX, don't over-rely on special day promotions. Create "returning visitor rewards" program to convert new visitors faster.</p>
+                </div>
+            </div>
+        </div>
+
+        <!-- Page 5: Traffic & Technology -->
+        <div id="page5" class="page-section">
+            <div class="page-title">
+                <h2>🌐 Page 5: Traffic &amp; Technology</h2>
+                <p>Traffic Source Quality and Regional Performance Analysis</p>
+            </div>
+
+            <!-- Visual 1: Traffic Flow Sankey Diagram -->
+            <div class="visual-card">
+                <h3>Visual 1: Traffic Flow - Source → Behavior → Outcome (Sankey Diagram)</h3>
+                
+                <h4>Purpose</h4>
+                <p>Visualize the complete journey from traffic quality through page behavior to final conversion outcome.</p>
+
+                <h4>Three-Level Flow Analysis</h4>
+                
+                <p><strong>Level 1: Traffic Quality Sources</strong></p>
+                <ul>
+                    <li><strong>Low_Converting_Traffic:</strong> 85% (10.42k sessions) - Majority of traffic, low quality</li>
+                    <li><strong>High_Converting_Traffic:</strong> 15% (1.91k sessions) - Minority but higher quality</li>
+                </ul>
+
+                <p><strong>Level 2: Dominant Page Type Behavior</strong></p>
+                <ul>
+                    <li>Low traffic flows 85% → Info_Focused (0%, 22 sessions - very small)</li>
+                    <li>Low traffic flows 85% → Admin_Focused (2%, 195 sessions)</li>
+                    <li>Low traffic flows 85% → Product_Focused (97%, 11.99k sessions - dominant)</li>
+                    <li>High traffic flows 15% → Product_Focused primarily</li>
+                </ul>
+
+                <p><strong>Level 3: Revenue Outcome</strong></p>
+                <ul>
+                    <li>Product_Focused → <strong>false</strong> (85%, 10.42k) - non-converters</li>
+                    <li>Product_Focused → <strong>true</strong> (15%, 1.91k) - converters</li>
+                </ul>
+
+                <div class="insight-box">
+                    <h4>💡 Quality vs Quantity Insight</h4>
+                    <p>Only 15% of traffic is high-converting, but this segment likely drives disproportionate revenue. The vast majority (85%) is low-converting traffic that flows through product pages but doesn't convert. This represents a significant traffic quality challenge.</p>
+                </div>
+
+                <div class="action-box">
+                    <h4>🎯 Traffic Optimization Strategy</h4>
+                    <p>Shift budget from low-converting sources to high-converting sources. Increase investment in channels driving the 15% high-quality traffic by 50%. Eliminate or reduce spend on the bottom 20% of low-converting sources. Focus on conversion rate over volume metrics. Expected impact: Improve overall ROI by 30% while potentially reducing total traffic.</p>
+                </div>
+            </div>
+
+            <!-- Visual 2: Regional Performance Bubble Chart -->
+            <div class="visual-card">
+                <h3>Visual 2: Regional Performance (Bubble Chart)</h3>
+                
+                <h4>Purpose</h4>
+                <p>Analyze geographic performance by region activity levels to identify expansion opportunities.</p>
+
+                <h4>Regional Analysis</h4>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Region Activity</th>
+                            <th>Visual Representation</th>
+                            <th>Bubble Size</th>
+                            <th>Strategic Value</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td>High_Traffic_Region</td>
+                            <td>Large purple bubbles</td>
+                            <td>~4.79K sessions (largest)</td>
+                            <td>🌟🌟🌟 Primary market</td>
+                        </tr>
+                        <tr>
+                            <td>Medium_Traffic_Region</td>
+                            <td>Medium pink bubbles</td>
+                            <td>~1.4K, ~1.2K sessions</td>
+                            <td>🌟🌟 Growth markets</td>
+                        </tr>
+                    </tbody>
+                </table>
+
+                <h4>Bubble Distribution Insights</h4>
+                <ul>
+                    <li>One dominant cluster (purple) at ~4.79K - represents primary geographic market</li>
+                    <li>Two medium-sized bubbles (pink) around 1.4K-1.2K range - secondary markets</li>
+                    <li>Clear visual separation indicates distinct regional performance tiers</li>
+                </ul>
+
+                <div class="insight-box">
+                    <h4>💡 Geographic Concentration</h4>
+                    <p>Traffic is heavily concentrated in one High_Traffic_Region (largest purple bubble at ~4.79K). This represents approximately 39% of total traffic, indicating strong but concentrated geographic performance. Medium regions show healthy secondary markets.</p>
+                </div>
+
+                <div class="action-box">
+                    <h4>🎯 Geographic Strategy</h4>
+                    <p>Three-pronged approach: (1) Defend and optimize the dominant High_Traffic_Region through increased local marketing and partnerships. (2) Invest in Medium_Traffic_Regions to grow them toward high-traffic status. (3) Investigate why certain regions aren't represented - are there untapped markets? Consider targeted expansion campaigns with localized content and regional promotions.</p>
+                </div>
+            </div>
+        </div>
+
+        <!-- Summary Section -->
+        <div id="summary" class="page-section active">
+            <div class="page-title">
+                <h2>🎯 Executive Summary: Key Findings &amp; Recommendations</h2>
+                <p>Actionable Insights with Quantified Business Impact</p>
+            </div>
+
+            <div class="visual-card">
+                <h3>Dashboard Performance Overview</h3>
+                <div class="stats-grid">
+                    <div class="stat-card">
+                        <span class="number">12,330</span>
+                        <span class="label">Total Sessions Analyzed</span>
+                    </div>
+                    <div class="stat-card">
+                        <span class="number">15%</span>
+                        <span class="label">Overall Conversion Rate</span>
+                    </div>
+                    <div class="stat-card">
+                        <span class="number">1,908</span>
+                        <span class="label">Total Converters</span>
+                    </div>
+                    <div class="stat-card">
+                        <span class="number">5</span>
+                        <span class="label">Dashboard Pages</span>
+                    </div>
+                </div>
+            </div>
+
+            <div class="visual-card">
+                <h3>Top 5 Conversion Drivers (From Dashboard Analysis)</h3>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Driver</th>
+                            <th>Best Segment</th>
+                            <th>Performance</th>
+                            <th>Impact</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td>Visitor Type</td>
+                            <td>Returning Visitors</td>
+                            <td>77.62% of converters</td>
+                            <td>⭐⭐⭐ Critical</td>
+                        </tr>
+                        <tr>
+                            <td>Shopping Time</td>
+                            <td>Weekday Shoppers</td>
+                            <td>77.06% of converters</td>
+                            <td>⭐⭐⭐ Critical</td>
+                        </tr>
+                        <tr>
+                            <td>Session Complexity</td>
+                            <td>Multi-Section Explorers</td>
+                            <td>Higher conversion rate</td>
+                            <td>⭐⭐ High</td>
+                        </tr>
+                        <tr>
+                            <td>Page Focus</td>
+                            <td>Product-Focused (97%)</td>
+                            <td>72.69% of converters</td>
+                            <td>⭐⭐ High</td>
+                        </tr>
+                        <tr>
+                            <td>Traffic Quality</td>
+                            <td>High-Converting Traffic</td>
+                            <td>15% of traffic</td>
+                            <td>⭐⭐ High</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+
+            <div class="visual-card">
+                <h3>Critical Opportunities Identified</h3>
+                
+                <h4>1. Funnel Optimization - HIGH PRIORITY ⚠️⚠️⚠️</h4>
+                <ul>
+                    <li>Issue: 50.2% drop-off between Deep Sessions and High Value Pages</li>
+                    <li>Current: Only 22.1% reach high-value pages</li>
+                    <li>Solution: Improve product recommendations, streamline navigation, add value propositions</li>
+                    <li>Expected Impact: +400 conversions monthly if reduced to 35% drop-off</li>
+                </ul>
+
+                <h4>2. Returning Visitor Retention - HIGH PRIORITY ⚠️⚠️⚠️</h4>
+                <ul>
+                    <li>Finding: 77.62% of conversions from returning visitors</li>
+                    <li>Opportunity: Convert new visitors faster, increase return rate</li>
+                    <li>Solution: Loyalty program, personalized emails, remarketing campaigns</li>
+                    <li>Expected Impact: +300 conversions monthly with 10% new-to-return improvement</li>
+                </ul>
+
+                <h4>3. Traffic Quality Enhancement - MEDIUM PRIORITY ⚠️⚠️</h4>
+                <ul>
+                    <li>Issue: 85% low-converting traffic vs 15% high-converting</li>
+                    <li>Solution: Reallocate budget to high-quality sources, eliminate poor performers</li>
+                    <li>Expected Impact: +30% ROI improvement, -15% cost</li>
+                </ul>
+
+                <h4>4. Seasonal Capitalization - MEDIUM PRIORITY ⚠️⚠️</h4>
+                <ul>
+                    <li>Finding: November peak with 18.2% conversion, Q4 strong performance</li>
+                    <li>Solution: Increase Q4 budget 40%, apply urgency tactics year-round</li>
+                    <li>Expected Impact: +500 annual conversions</li>
+                </ul>
+
+                <h4>5. Multi-Section Exploration - MEDIUM PRIORITY ⚠️⚠️</h4>
+                <ul>
+                    <li>Finding: Multi-section explorers convert significantly better</li>
+                    <li>Current: Only 6% are multi-section explorers</li>
+                    <li>Solution: Cross-sell widgets, related products, guided shopping</li>
+                    <li>Expected Impact: +180 conversions monthly if 10% more users explore multiple sections</li>
+                </ul>
+            </div>
+
+            <div class="visual-card">
+                <h3>Implementation Roadmap</h3>
+                
+                <h4>Phase 1 (Month 1-2): Quick Wins</h4>
+                <ul>
+                    <li>Implement "Related Products" on product pages</li>
+                    <li>Add exit-intent popups for abandoning users</li>
+                    <li>Launch email remarketing for new visitors</li>
+                    <li>Expected: +150 conversions monthly</li>
+                </ul>
+
+                <h4>Phase 2 (Month 3-4): Strategic Initiatives</h4>
+                <ul>
+                    <li>Launch loyalty program for returning visitors</li>
+                    <li>Optimize funnel between Deep Sessions and High Value Pages</li>
+                    <li>Reallocate marketing budget to high-quality sources</li>
+                    <li>Expected: +400 conversions monthly</li>
+                </ul>
+
+                <h4>Phase 3 (Month 5-6): Optimization &amp; Scale</h4>
+                <ul>
+                    <li>Prepare Q4 seasonal campaigns</li>
+                    <li>Expand successful tactics to all segments</li>
+                    <li>A/B test conversion improvements</li>
+                    <li>Expected: +500 conversions monthly during Q4</li>
+                </ul>
+
+                <div class="action-box">
+                    <h4>🎯 6-Month Goal</h4>
+                    <p><strong>Target:</strong> Increase conversion rate from 15% to 19%+ through systematic optimization. This represents +493 monthly conversions and +$74,000 monthly revenue (assuming $150 AOV).</p>
+                </div>
+            </div>
+
+            <div class="visual-card">
+                <h3>Monitoring &amp; Success Metrics</h3>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Metric</th>
+                            <th>Current</th>
+                            <th>Target (6 months)</th>
+                            <th>Measurement</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td>Overall Conversion Rate</td>
+                            <td>15%</td>
+                            <td>19%</td>
+                            <td>Monthly tracking</td>
+                        </tr>
+                        <tr>
+                            <td>Returning Visitor %</td>
+                            <td>66%</td>
+                            <td>70%</td>
+                            <td>Weekly tracking</td>
+                        </tr>
+                        <tr>
+                            <td>Multi-Section Explorer %</td>
+                            <td>6%</td>
+                            <td>12%</td>
+                            <td>Weekly tracking</td>
+                        </tr>
+                        <tr>
+                            <td>High-Quality Traffic %</td>
+                            <td>15%</td>
+                            <td>25%</td>
+                            <td>Monthly tracking</td>
+                        </tr>
+                        <tr>
+                            <td>Funnel Completion Rate</td>
+                            <td>15.5%</td>
+                            <td>20%</td>
+                            <td>Weekly tracking</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <button class="download-all" onclick="downloadReport()">
+        📥 Download Complete Report
+    </button>
+
+    <script>
+        function showPage(pageId) {
+            document.querySelectorAll('.page-section').forEach(section => {
+                section.classList.remove('active');
+            });
+            
+            document.querySelectorAll('.nav-btn').forEach(btn => {
+                btn.classList.remove('active');
+            });
+            
+            document.getElementById(pageId).classList.add('active');
+            
+            event.target.classList.add('active');
+            
+            window.scrollTo({ top: 0, behavior: 'smooth' });
+        }
+
+        function downloadReport() {
+            const content = document.documentElement.outerHTML;
+            const blob = new Blob([content], { type: 'text/html' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = 'Online_Shoppers_Dashboard_Analysis_Report.html';
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+            
+            alert('✅ Report downloaded successfully!\n\nYou can:\n1. Open in any browser\n2. Copy sections to Google Sites\n3. Print to PDF (Ctrl+P)\n4. Share with stakeholders');
+        }
+    </script>
+</body></html>
